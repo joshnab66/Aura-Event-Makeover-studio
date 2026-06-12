@@ -1,0 +1,6 @@
+{
+  "name": "Luxe Event & Makeover Services",
+  "description": "Premium full-service interactive platform for high-end event planning, makeover services, virtual consultations, and custom event configuration.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
