@@ -59,6 +59,9 @@ import {
   BookingSubmission, 
   ChatMessage 
 } from "./types";
+import { auth, googleProvider, db, handleFirestoreError, OperationType } from "./firebase";
+import { signInWithPopup, signOut, onAuthStateChanged, User as FirebaseUser } from "firebase/auth";
+import { doc, setDoc, getDocs, collection } from "firebase/firestore";
 
 const HERO_IMAGES = [
   "https://files.catbox.moe/mdcu5g.jpg",
@@ -95,6 +98,9 @@ export default function App() {
   const [bookingSuccess, setBookingSuccess] = useState(false);
   const [bookingLoading, setBookingLoading] = useState(false);
   const [isAdminView, setIsAdminView] = useState(false);
+
+  // Firebase Authentication State
+  const [currentUser, setCurrentUser] = useState<FirebaseUser | null>(null);
 
   // Customizer / Planner Wizard State
   const [wizardStep, setWizardStep] = useState(1);
@@ -143,19 +149,41 @@ export default function App() {
   const [newsletterEmail, setNewsletterEmail] = useState("");
   const [newsletterSubscribed, setNewsletterSubscribed] = useState(false);
 
-  // Fetch initial bookings on mount
+  // Load and listen to bookings with automatic fallbacks
   useEffect(() => {
-    fetch("/api/bookings")
-      .then(res => res.json())
-      .then((data: any) => {
-        if (data && data.bookings) {
-          setBookings(data.bookings);
-        }
-      })
-      .catch(err => console.error("Could not fetch bookings on mount", err));
+    const fetchBookings = async () => {
+      try {
+        const querySnapshot = await getDocs(collection(db, "bookings"));
+        const list: BookingSubmission[] = [];
+        querySnapshot.forEach((doc) => {
+          list.push(doc.data() as BookingSubmission);
+        });
+        list.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+        setBookings(list);
+      } catch (err) {
+        console.warn("Could not fetch bookings from Firestore directly, trying backend endpoint...", err);
+        // Fallback to fetch from existing backend placeholder route if Firestore fetch fails or is unauthenticated
+        fetch("/api/bookings")
+          .then(res => res.json())
+          .then((data: any) => {
+            if (data && data.bookings) {
+              setBookings(data.bookings);
+            }
+          })
+          .catch(err2 => console.error("Could not fetch bookings on mount", err2));
+      }
+    };
+
+    // Listen to Firebase Auth state
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      setCurrentUser(user);
+      fetchBookings();
+    });
+
+    return () => unsubscribe();
   }, []);
 
-  // Submit standard reservation
+  // Submit standard reservation to Firebase Firestore with fallback sync
   const handleBookingSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!name || !email || !phone || !bookingDate) {
@@ -164,7 +192,10 @@ export default function App() {
     }
 
     setBookingLoading(true);
-    const postBody = {
+
+    const bookingId = `b_${Date.now()}`;
+    const newBooking: BookingSubmission = {
+      id: bookingId,
       name,
       email,
       phone,
@@ -172,45 +203,55 @@ export default function App() {
       dateTime: bookingDate,
       approxBudget,
       guestCount: guestCountInput,
-      specialRequirements: specialReq
+      specialRequirements: specialReq || "None",
+      createdAt: new Date().toISOString()
     };
 
     try {
-      const response = await fetch("/api/bookings", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(postBody)
-      });
-      const data = await response.json();
-      if (data.success) {
-        setBookingSuccess(true);
-        // Refresh bookings array
-        setBookings(prev => [data.booking, ...prev]);
-        // Reset inputs
-        setName("");
-        setEmail("");
-        setPhone("");
-        setSpecialReq("");
-      } else {
-        alert("Booking server temporary failure.");
+      // 1. Submit directly to Firestore
+      await setDoc(doc(db, "bookings", bookingId), newBooking);
+
+      // Attempt backup sync with Express backend local database
+      try {
+        await fetch("/api/bookings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(newBooking)
+        });
+      } catch (syncErr) {
+        console.warn("Server backup sync declined/unavailable:", syncErr);
       }
-    } catch (err) {
-      console.error(err);
-      // fallback save locally
-      const localBooking: BookingSubmission = {
-        id: `local_${Date.now()}`,
-        name,
-        email,
-        phone,
-        eventType,
-        dateTime: bookingDate,
-        approxBudget,
-        guestCount: guestCountInput,
-        specialRequirements: specialReq,
-        createdAt: new Date().toISOString()
-      };
-      setBookings(prev => [localBooking, ...prev]);
+
       setBookingSuccess(true);
+      setBookings(prev => [newBooking, ...prev]);
+      // Reset inputs
+      setName("");
+      setEmail("");
+      setPhone("");
+      setSpecialReq("");
+    } catch (err) {
+      console.warn("Firestore write failed, falling back to local server save", err);
+      // Try backend local backup saving
+      try {
+        const response = await fetch("/api/bookings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(newBooking)
+        });
+        const data = await response.json();
+        if (data.success) {
+          setBookingSuccess(true);
+          setBookings(prev => [data.booking, ...prev]);
+          setName("");
+          setEmail("");
+          setPhone("");
+          setSpecialReq("");
+        } else {
+          throw new Error("Local backup sync also failed.");
+        }
+      } catch (err2) {
+        handleFirestoreError(err2, OperationType.WRITE, `bookings/${bookingId}`);
+      }
     } finally {
       setBookingLoading(false);
     }
@@ -1722,71 +1763,120 @@ export default function App() {
               </div>
 
               {isAdminView ? (
-                // ADMIN MANAGEMET PANEL
-                <motion.div 
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  className="bg-white p-6 md:p-10 rounded-3xl border border-amber-100 shadow-sm space-y-6"
-                >
-                  <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+                // ADMIN MANAGEMENT PANEL WITH GOOGLE LOGIN GATE
+                !currentUser ? (
+                  <motion.div 
+                    initial={{ opacity: 0, scale: 0.95 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    className="bg-white p-8 md:p-12 rounded-3xl border border-amber-100 shadow-sm max-w-md mx-auto text-center space-y-6"
+                  >
+                    <Crown className="w-12 h-12 text-[#cca43b] mx-auto animate-pulse" />
                     <div>
-                      <h3 className="font-serif text-xl font-bold text-[#1e0b36]">Aura Booking Registrations</h3>
-                      <p className="text-slate-500 text-xs mt-0.5">Below is a list of premium appointments saved to the local server database.</p>
+                      <h3 className="font-serif text-2xl font-bold text-[#1e0b36]">Prestige Admin Login</h3>
+                      <p className="text-slate-500 text-xs mt-2 max-w-sm mx-auto">
+                        This registry is restricted to authorized designers. Access is managed securely via Google Sign-In with real-time Firebase Authentication.
+                      </p>
                     </div>
-                    <span className="bg-[#1e0b36] text-[#cca43b] px-3.5 py-1 text-xs font-bold uppercase rounded-lg">
-                      Record Volume: {bookings.length} Registered
-                    </span>
-                  </div>
+                    <button
+                      onClick={async () => {
+                        try {
+                          await signInWithPopup(auth, googleProvider);
+                        } catch (err) {
+                          console.error("Sign-in failed", err);
+                          alert("Prestige authentication failed. Please confirm Google setup.");
+                        }
+                      }}
+                      className="w-full bg-[#1e0b36] hover:bg-slate-900 text-[#FAF6F0] hover:text-white px-6 py-3 font-bold uppercase tracking-wider text-xs rounded-xl shadow-lg transition-all duration-300 flex items-center justify-center gap-2"
+                    >
+                      <Globe className="w-4 h-4" />
+                      Sign In with Google
+                    </button>
+                  </motion.div>
+                ) : (
+                  <motion.div 
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    className="bg-white p-6 md:p-10 rounded-3xl border border-amber-100 shadow-sm space-y-6"
+                  >
+                    <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 border-b border-amber-50 pb-4">
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <span className="w-2.5 h-2.5 bg-emerald-500 rounded-full animate-ping"></span>
+                          <h3 className="font-serif text-xl font-bold text-[#1e0b36]">Aura Booking Registrations</h3>
+                        </div>
+                        <p className="text-slate-500 text-[11px] mt-0.5">
+                          Logged in as <span className="font-semibold text-[#cca43b]">{currentUser.email || currentUser.displayName}</span>
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-3">
+                        <span className="bg-[#1e0b36] text-[#cca43b] px-3.5 py-1 text-[10px] font-bold uppercase rounded-lg">
+                          Registry Size: {bookings.length}
+                        </span>
+                        <button
+                          onClick={async () => {
+                            try {
+                              await signOut(auth);
+                            } catch (err) {
+                              console.error("Sign-out failed", err);
+                            }
+                          }}
+                          className="px-3 py-1 bg-rose-50 hover:bg-rose-100 text-rose-600 text-[9px] uppercase font-bold tracking-widest rounded transition-colors"
+                        >
+                          Sign Out
+                        </button>
+                      </div>
+                    </div>
 
-                  {bookings.length === 0 ? (
-                    <div className="text-center py-12 border-2 border-dashed border-slate-200 rounded-2xl bg-[#FAF6F0]">
-                      <Calendar className="w-12 h-12 text-[#cca43b]/40 mx-auto" />
-                      <h4 className="font-serif font-bold text-slate-700 mt-4">Empty Reservations</h4>
-                      <p className="text-slate-400 text-xs max-w-sm mx-auto mt-1">No bookings are stored on the server yet. Generate simulated slots or complete the main form.</p>
-                    </div>
-                  ) : (
-                    <div className="overflow-x-auto rounded-xl border border-slate-200/60 shadow-sm">
-                      <table className="w-full text-xs text-left bg-white">
-                        <thead className="bg-[#1e0b36] text-[#cca43b] text-[10px] uppercase tracking-wider font-bold">
-                          <tr>
-                            <th className="py-3 px-4">Client Name</th>
-                            <th className="py-3 px-4">Contact Credentials</th>
-                            <th className="py-3 px-4">Event Preference</th>
-                            <th className="py-3 px-4">Date & Time</th>
-                            <th className="py-3 px-4">Scale / Budget</th>
-                            <th className="py-3 px-4">Special Requests</th>
-                          </tr>
-                        </thead>
-                        <tbody className="divide-y divide-slate-150">
-                          {bookings.map((booking) => (
-                            <tr key={booking.id} className="hover:bg-[#FAF6F0]/50">
-                              <td className="py-4 px-4 font-bold text-slate-800 font-serif text-sm">{booking.name}</td>
-                              <td className="py-4 px-4">
-                                <span className="block">{booking.email}</span>
-                                <span className="block text-slate-400 font-mono mt-0.5">{booking.phone}</span>
-                              </td>
-                              <td className="py-4 px-4">
-                                <span className="bg-amber-100/60 border border-amber-200 text-[#8a6a24] px-2 py-0.5 rounded text-[10px] uppercase font-bold font-mono">
-                                  {booking.eventType}
-                                </span>
-                              </td>
-                              <td className="py-4 px-4 text-slate-600 font-mono text-[11px]">
-                                {new Date(booking.dateTime).toLocaleDateString()} at {new Date(booking.dateTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                              </td>
-                              <td className="py-4 px-4">
-                                <span className="block font-semibold">{booking.guestCount} Guests</span>
-                                <span className="text-[10px] uppercase font-bold text-[#cca43b]">{booking.approxBudget} Tier</span>
-                              </td>
-                              <td className="py-4 px-4 italic text-slate-500 max-w-xs truncate" title={booking.specialRequirements}>
-                                {booking.specialRequirements || "N/A"}
-                              </td>
+                    {bookings.length === 0 ? (
+                      <div className="text-center py-12 border-2 border-dashed border-slate-200 rounded-2xl bg-[#FAF6F0]">
+                        <Calendar className="w-12 h-12 text-[#cca43b]/40 mx-auto" />
+                        <h4 className="font-serif font-bold text-slate-700 mt-4">Empty Reservations</h4>
+                        <p className="text-slate-400 text-xs max-w-sm mx-auto mt-1">No bookings are stored on the server yet. Generate simulated slots or complete the main form.</p>
+                      </div>
+                    ) : (
+                      <div className="overflow-x-auto rounded-xl border border-slate-200/60 shadow-sm">
+                        <table className="w-full text-xs text-left bg-white">
+                          <thead className="bg-[#1e0b36] text-[#cca43b] text-[10px] uppercase tracking-wider font-bold">
+                            <tr>
+                              <th className="py-3 px-4">Client Name</th>
+                              <th className="py-3 px-4">Contact Credentials</th>
+                              <th className="py-3 px-4">Event Preference</th>
+                              <th className="py-3 px-4">Date & Time</th>
+                              <th className="py-3 px-4">Scale / Budget</th>
+                              <th className="py-3 px-4">Special Requests</th>
                             </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  )}
-                </motion.div>
+                          </thead>
+                          <tbody className="divide-y divide-slate-150">
+                            {bookings.map((booking) => (
+                              <tr key={booking.id} className="hover:bg-[#FAF6F0]/50">
+                                <td className="py-4 px-4 font-bold text-slate-800 font-serif text-sm">{booking.name}</td>
+                                <td className="py-4 px-4">
+                                  <span className="block">{booking.email}</span>
+                                  <span className="block text-slate-400 font-mono mt-0.5">{booking.phone}</span>
+                                </td>
+                                <td className="py-4 px-4">
+                                  <span className="bg-amber-100/60 border border-amber-200 text-[#8a6a24] px-2 py-0.5 rounded text-[10px] uppercase font-bold font-mono">
+                                    {booking.eventType}
+                                  </span>
+                                </td>
+                                <td className="py-4 px-4 text-slate-600 font-mono text-[11px]">
+                                  {new Date(booking.dateTime).toLocaleDateString()} at {new Date(booking.dateTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                </td>
+                                <td className="py-4 px-4">
+                                  <span className="block font-semibold">{booking.guestCount} Guests</span>
+                                  <span className="text-[10px] uppercase font-bold text-[#cca43b]">{booking.approxBudget} Tier</span>
+                                </td>
+                                <td className="py-4 px-4 italic text-slate-500 max-w-xs truncate" title={booking.specialRequirements}>
+                                  {booking.specialRequirements || "N/A"}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </motion.div>
+                )
               ) : (
                 // STANDARD BOOKING FORM + INFORMATION
                 <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">

@@ -1,0 +1,28 @@
+{
+  "entities": {
+    "booking": {
+      "title": "BookingSubmission",
+      "description": "Details of an event booking request submitted by a client",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "email": { "type": "string" },
+        "phone": { "type": "string" },
+        "eventType": { "type": "string" },
+        "dateTime": { "type": "string" },
+        "approxBudget": { "type": "string" },
+        "guestCount": { "type": "integer" },
+        "specialRequirements": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "name", "email", "phone", "eventType", "dateTime", "approxBudget", "guestCount", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/bookings/{bookingId}": {
+      "schema": "booking",
+      "description": "Collection of event decor and makeover bookings"
+    }
+  }
+}
